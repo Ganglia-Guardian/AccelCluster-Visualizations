@@ -1,0 +1,9 @@
+pandas
+numpy
+seaborn
+matplotlib
+pycirclize
+plotly
+networkx
+kaleido
+scikit-learn
