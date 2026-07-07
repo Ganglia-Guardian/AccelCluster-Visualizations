@@ -117,6 +117,9 @@ PREFERRED_ORDER = {
     "temporal_class": ["early", "mid", "late", "sustained", "uncategorized", "unknown"],
     "tba_class": ["low", "high", "unknown"],
 }
+# De-emphasized categories drawn first so they sit UNDERNEATH the meaningful
+# points (plotly draws earlier categories at the bottom of the z-order).
+BACKGROUND_CATEGORIES = {"uncategorized", "unknown"}
 
 
 class ColorSpec:
@@ -156,8 +159,11 @@ def build_coloring(details, color_by, palette, gradient_colorscale):
         values = details[color_by].astype("string").fillna("unknown").to_numpy()
         present = list(pd.unique(values))
         pref_order = PREFERRED_ORDER[color_by]
-        order = ([c for c in pref_order if c in present]
-                 + [c for c in present if c not in pref_order])
+        semantic = ([c for c in pref_order if c in present]
+                    + [c for c in present if c not in pref_order])
+        # Draw background categories first (bottom) so meaningful points sit on top.
+        order = ([c for c in semantic if c in BACKGROUND_CATEGORIES]
+                 + [c for c in semantic if c not in BACKGROUND_CATEGORIES])
         fallback = palette_colors(palette, len(order))
         preferred = PREFERRED_COLORS[color_by]
         discrete_map = {name: preferred.get(name, fallback[i]) for i, name in enumerate(order)}
