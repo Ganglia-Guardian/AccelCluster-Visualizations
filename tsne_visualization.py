@@ -319,18 +319,33 @@ def plot_embedding(embedding, values, spec, title, out_path, args, show=False):
 
 
 def build_gif(png_paths, gif_path, fps):
-    """Assemble PNG frames into a looping GIF at the given fps (needs >=2 frames)."""
+    """Assemble PNG frames into a looping GIF at the given fps (needs >=2 frames).
+
+    All frames are quantized to a single shared palette built from every frame,
+    so the GIF has one global color table. Without that, Pillow gives each RGB
+    frame its own local palette and many viewers (Windows Photos, some browsers)
+    render only the first frame -- the GIF looks static even though the frames
+    are there.
+    """
     if len(png_paths) < 2:
         print(f"[warn] only {len(png_paths)} frame(s); skipping GIF {gif_path}")
         return None
     from PIL import Image
-    frames = [Image.open(p).convert("RGB") for p in png_paths]
+
+    rgb = [Image.open(p).convert("RGB") for p in png_paths]
+    # One palette that covers colors from every frame (stack them, then quantize).
+    montage = Image.fromarray(np.concatenate([np.asarray(im) for im in rgb], axis=0))
+    shared_palette = montage.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+    frames = [im.quantize(palette=shared_palette, dither=Image.Dither.NONE) for im in rgb]
+
     frames[0].save(
         gif_path,
         save_all=True,
         append_images=frames[1:],
-        duration=int(round(1000 / fps)),
+        duration=[int(round(1000 / fps))] * len(frames),
         loop=0,
+        disposal=2,       # clear each frame before drawing the next
+        optimize=False,   # don't let the optimizer merge/drop frames
     )
     print(f"[ok] wrote GIF ({len(frames)} frames @ {fps} fps): {gif_path}")
     return gif_path
