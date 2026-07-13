@@ -15,9 +15,11 @@ Color masks (--color-by)
   temporal_class early/mid/late/sustained/... (categorical)
   tba_class      high/low total-body-accel class (categorical)
   tba            total-body-accel value (continuous gradient)
-The last three come from ``Cluster_detail_results_temporal.csv`` (same rows as
-the main details file, with extra columns). It is attached automatically when
-present.
+  occ3d          per-cluster fraction of points from 3D arenas (continuous 0..1)
+temporal_class/tba_class/tba come from ``Cluster_detail_results_temporal.csv``
+(same rows as the main details file, with extra columns), attached automatically
+when present. occ3d is derived from Folder_Name in mixed-arena data, where a week
+token like "week8" is a 3D recording and "week8_O" is its 2D open-field version.
 
 Three things it can produce:
   1. A single global embedding.
@@ -96,14 +98,44 @@ def palette_colors(palette, n):
 # --------------------------------------------------------------------------- #
 # Color masks
 # --------------------------------------------------------------------------- #
-COLOR_CHOICES = ["cluster", "temporal_class", "tba_class", "tba"]
+COLOR_CHOICES = ["cluster", "temporal_class", "tba_class", "tba", "occ3d"]
 TEMPORAL_COLUMNS = {"temporal_class", "tba_class", "tba"}
 COLOR_LABELS = {
     "cluster": "Cluster",
     "temporal_class": "Temporal class",
     "tba_class": "TBA class",
     "tba": "TBA",
+    "occ3d": "3D occupancy fraction",
 }
+
+# Mixed-arena classification from Folder_Name: a week token like "week8"/"wk8"
+# is a 3D recording; the same token with an _o/_O marker ("week8_O") is the 2D
+# open-field version.
+WEEK_TOKEN_RE = re.compile(r"w(?:ee)?k_?\d+", re.IGNORECASE)
+ARENA_2D_RE = re.compile(r"w(?:ee)?k_?\d+_o", re.IGNORECASE)
+
+
+def arena_type(folder):
+    """'3d', '2d', or None for a Folder_Name value (None = not an arena week)."""
+    if not isinstance(folder, str):
+        return None
+    if ARENA_2D_RE.search(folder):
+        return "2d"
+    if WEEK_TOKEN_RE.search(folder):
+        return "3d"
+    return None
+
+
+# Default gradient for occ3d: fully-saturated blue (2D) -> magenta (shared) ->
+# red (3D). No light tones, so shared clusters near 0.5 stay visible against the
+# light plot background (RdBu/Viridis wash out to near-white at the midpoint).
+OCC3D_COLORSCALE = [
+    [0.00, "#1f5cff"],  # pure 2D
+    [0.25, "#7a2cff"],
+    [0.50, "#d500c8"],  # shared
+    [0.75, "#ff2f7a"],
+    [1.00, "#ff2a00"],  # pure 3D
+]
 # Hand-picked colors for the categorical temporal masks (falls back to the chosen
 # palette for any category not listed here). NaN/missing -> "unknown" -> gray.
 PREFERRED_COLORS = {
@@ -143,11 +175,29 @@ def build_coloring(details, color_by, palette, gradient_colorscale):
         sys.exit(f"[error] --color-by {color_by} needs the '{color_by}' column; "
                  f"provide Cluster_detail_results_temporal.csv (see --temporal-name).")
 
+    if color_by == "occ3d":  # per-cluster fraction of points recorded in 3D arenas
+        arena = details["Arena"].to_numpy()
+        clusters = details["ClusterLabel"].to_numpy()
+        classified = pd.DataFrame({"cluster": clusters, "arena": arena})
+        classified = classified[classified["arena"].isin(["2d", "3d"])]
+        if classified.empty:
+            sys.exit("[error] --color-by occ3d: no 3D/2D arena weeks detected in "
+                     "Folder_Name (expected e.g. 'week8' for 3D and 'week8_O' for 2D).")
+        frac3d = (classified["arena"] == "3d").groupby(classified["cluster"]).mean()
+        values = frac3d.reindex(clusters).to_numpy(dtype=float)
+        n3d = int((classified["arena"] == "3d").sum())
+        n2d = int((classified["arena"] == "2d").sum())
+        print(f"[ok] occ3d: {n3d} 3D + {n2d} 2D points over {frac3d.notna().sum()} clusters")
+        # Absolute 0..1 scale (0 = only 2D, 1 = only 3D, ~0.5 = shared). Use the
+        # striking blue->magenta->red scale unless the user names one explicitly.
+        scale = gradient_colorscale or OCC3D_COLORSCALE
+        return ColorSpec(color_by, values, "continuous", colorscale=scale, crange=(0.0, 1.0))
+
     if color_by == "tba":  # continuous gradient
         values = pd.to_numeric(details["tba"], errors="coerce").to_numpy(dtype=float)
         crange = (float(np.nanmin(values)), float(np.nanmax(values)))
         return ColorSpec(color_by, values, "continuous",
-                         colorscale=gradient_colorscale, crange=crange)
+                         colorscale=gradient_colorscale or "Viridis", crange=crange)
 
     if color_by == "cluster":
         values = details["ClusterLabel"].to_numpy()
@@ -197,6 +247,7 @@ def load_details(details_path, temporal_path=None):
     # notebook's combined_matrix convention).
     df["Week"] = folder.ffill().astype("string")
     df["WeekSort"] = df["Week"].map(week_sort_key)
+    df["Arena"] = df["Week"].map(arena_type)  # '3d' / '2d' / None (mixed-arena data)
 
     if not TEMPORAL_COLUMNS.issubset(df.columns) and temporal_path and os.path.exists(temporal_path):
         _attach_temporal(df, temporal_path)
@@ -221,24 +272,38 @@ def _attach_temporal(df, temporal_path):
     print(f"[ok] attached temporal columns from {os.path.basename(temporal_path)}")
 
 
-def week_sort_key(label):
-    """Numeric-ish sort key from a folder/week label like 'w10' or 'w24_ldopa'.
+# Ordering of same-week variants: bare week first, then saline, then ldopa.
+SUFFIX_RANK = {"": 0, "saline": 1, "ldopa": 2}
 
-    'w10' -> (10, '') ; 'w24_saline' -> (24, 'saline') ; unknown -> (inf, str).
+
+def week_sort_key(label):
+    """Chronological sort key from a folder/week label like 'w10' or 'w24_ldopa'.
+
+    Sorts by week number, then by variant so a week group reads
+    w24 -> w24_saline -> w24_ldopa. Unknown labels sort last.
+    'w10' -> (10, 0, '') ; 'w24_saline' -> (24, 1, 'saline').
     """
     if not isinstance(label, str):
-        return (float("inf"), "")
-    m = re.search(r"(?:week|w)\s*(\d+)", label, re.IGNORECASE)
+        return (float("inf"), 99, "")
+    m = re.search(r"(?:week|wk|w)_?(\d+)", label, re.IGNORECASE)
     if not m:
-        return (float("inf"), label)
+        return (float("inf"), 99, label)
     suffix = label[m.end():].lstrip("_ ").lower()
-    return (int(m.group(1)), suffix)
+    return (int(m.group(1)), SUFFIX_RANK.get(suffix, 98), suffix)
 
 
-def ordered_weeks(details, only=None):
-    """Return week labels in chronological order, optionally filtered to `only`."""
+def ordered_weeks(details, only=None, arena_first=None):
+    """Return week labels in chronological order, optionally filtered to `only`.
+
+    If `arena_first` ('2d' or '3d') is given, weeks are grouped by arena type --
+    that type's weeks (ascending) first, then the rest (ascending). Used by the
+    occ3d mask so the animation plays one arena type through, then the other.
+    """
     weeks = [w for w in details["Week"].dropna().unique()]
-    weeks.sort(key=week_sort_key)
+    if arena_first:
+        weeks.sort(key=lambda w: (0 if arena_type(w) == arena_first else 1, week_sort_key(w)))
+    else:
+        weeks.sort(key=week_sort_key)
     if only:
         only = set(only)
         missing = only - set(weeks)
@@ -304,6 +369,8 @@ def plot_embedding(embedding, values, spec, title, out_path, args, show=False):
     kwargs = dict(
         x=embedding[:, 0],
         y=embedding[:, 1],
+        range_x=[-90, 90],
+        range_y=[-90,90],
         color=values,
         title=title,
         labels={"x": "t-SNE 1", "y": "t-SNE 2", "color": spec.label},
@@ -344,27 +411,86 @@ def build_gif(png_paths, gif_path, fps):
     shared_palette = montage.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
     frames = [im.quantize(palette=shared_palette, dither=Image.Dither.NONE) for im in rgb]
 
+    # Standard, full-frame encode: one global palette, one constant delay, loop
+    # forever. No custom disposal (opaque full frames overwrite cleanly) -- some
+    # players (VLC) mis-handle disposal=2 and stop partway through.
     frames[0].save(
         gif_path,
         save_all=True,
         append_images=frames[1:],
-        duration=[int(round(1000 / fps))] * len(frames),
+        duration=int(round(1000 / fps)),
         loop=0,
-        disposal=2,       # clear each frame before drawing the next
         optimize=False,   # don't let the optimizer merge/drop frames
     )
     print(f"[ok] wrote GIF ({len(frames)} frames @ {fps} fps): {gif_path}")
     return gif_path
 
 
+def build_mp4(png_paths, mp4_path, fps):
+    """Encode PNG frames into an MP4 via ffmpeg (reliable in VLC / Media Player).
+
+    Video players handle animated GIFs poorly; an MP4 plays everywhere. Frames
+    are copied to a sequentially-numbered temp folder and fed to ffmpeg as an
+    image sequence -- this guarantees frame order and one equal delay per frame
+    (the concat demuxer mis-orders images and stretches the first frame). Returns
+    None (with a warning) if ffmpeg isn't on PATH or there are <2 frames.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if len(png_paths) < 2:
+        print(f"[warn] only {len(png_paths)} frame(s); skipping MP4 {mp4_path}")
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("[warn] ffmpeg not found on PATH; skipping MP4 (GIF still written).")
+        return None
+
+    tmpdir = tempfile.mkdtemp(prefix="tsne_mp4_")
+    try:
+        for i, p in enumerate(png_paths):
+            shutil.copyfile(p, os.path.join(tmpdir, f"frame_{i:05d}.png"))
+        cmd = [
+            ffmpeg, "-y",
+            "-framerate", str(fps),                       # each image shows 1/fps s
+            "-i", os.path.join(tmpdir, "frame_%05d.png"),
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",    # even dims for yuv420p
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", mp4_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if result.returncode != 0:
+        print(f"[warn] ffmpeg failed; MP4 not written:\n{result.stderr[-500:]}")
+        return None
+    print(f"[ok] wrote MP4 ({len(png_paths)} frames @ {fps} fps): {mp4_path}")
+    return mp4_path
+
+
+def build_animation(png_paths, gif_path, fps, make_mp4):
+    """Write the GIF and, when requested, an MP4 alongside it (same basename)."""
+    build_gif(png_paths, gif_path, fps)
+    if make_mp4:
+        build_mp4(png_paths, os.path.splitext(gif_path)[0] + ".mp4", fps)
+
+
 # --------------------------------------------------------------------------- #
 # Modes
 # --------------------------------------------------------------------------- #
+def arena_first_for(args):
+    """Arena group to play first, or None (only occ3d groups weeks by arena)."""
+    if args.color_by != "occ3d":
+        return None
+    return "2d" if args.arena_order == "2d-first" else "3d"
+
+
 def run_weekly_subset(embedding, details, spec, out_root, args):
     """Mode: subset the ALREADY-computed global embedding to each week and plot."""
     sub_dir = os.path.join(out_root, f"weekly_by_week_{args.color_by}")
     os.makedirs(sub_dir, exist_ok=True)
-    weeks = ordered_weeks(details, args.weeks)
+    weeks = ordered_weeks(details, args.weeks, arena_first_for(args))
     frames = []
     for week in weeks:
         mask = (details["Week"] == week).to_numpy()
@@ -377,7 +503,8 @@ def run_weekly_subset(embedding, details, spec, out_root, args):
                        args, show=args.show)
         print(f"[ok] week {week}: {out_path}")
         frames.append(out_path)
-    build_gif(frames, os.path.join(sub_dir, f"tsne_weekly_{args.color_by}.gif"), args.gif_fps)
+    build_animation(frames, os.path.join(sub_dir, f"tsne_weekly_{args.color_by}.gif"),
+                    args.gif_fps, args.mp4)
 
 
 def run_per_week_embedding(mat_path, details, spec, out_root, args):
@@ -385,7 +512,7 @@ def run_per_week_embedding(mat_path, details, spec, out_root, args):
     to that week's rows/cols before embedding)."""
     sub_dir = os.path.join(out_root, f"weekly_embeddings_{args.color_by}")
     os.makedirs(sub_dir, exist_ok=True)
-    weeks = ordered_weeks(details, args.weeks)
+    weeks = ordered_weeks(details, args.weeks, arena_first_for(args))
     frames = []
     with h5py.File(mat_path, "r") as f:
         sim = f["Clusters"]["sim"]
@@ -420,8 +547,8 @@ def run_per_week_embedding(mat_path, details, spec, out_root, args):
                            args, show=args.show)
             print(f"[ok] week {week}: {out_path}")
             frames.append(out_path)
-    build_gif(frames, os.path.join(sub_dir, f"tsne_weekly_embeddings_{args.color_by}.gif"),
-              args.gif_fps)
+    build_animation(frames, os.path.join(sub_dir, f"tsne_weekly_embeddings_{args.color_by}.gif"),
+                    args.gif_fps, args.mp4)
 
 
 def run_global(mat_path, details, spec, out_root, args):
@@ -501,13 +628,18 @@ def parse_args(argv=None):
     # Color
     p.add_argument("--color-by", default="cluster", choices=COLOR_CHOICES,
                    help="Which color mask to use: cluster index (glasbey), "
-                        "temporal_class, tba_class, or a tba gradient.")
+                        "temporal_class, tba_class, a tba gradient, or occ3d "
+                        "(per-cluster 3D-arena occupancy fraction, 0..1).")
     p.add_argument("--palette", default="glasbey", choices=PALETTE_CHOICES,
                    help="Categorical palette (used for cluster mode and as a "
                         "fallback for unlisted temporal categories).")
-    p.add_argument("--gradient-colorscale", default="Viridis",
-                   help="Continuous colorscale for --color-by tba (any plotly "
-                        "colorscale name, e.g. Viridis, Turbo, Inferno).")
+    p.add_argument("--gradient-colorscale", default=None,
+                   help="Continuous colorscale for tba/occ3d (any plotly colorscale "
+                        "name, e.g. Viridis, Turbo, RdBu). Default: Viridis for tba, "
+                        "a saturated blue->magenta->red scale for occ3d.")
+    p.add_argument("--arena-order", default="2d-first", choices=["2d-first", "3d-first"],
+                   help="Frame ordering for --color-by occ3d only: play all 2D (or 3D) "
+                        "arena weeks in ascending order, then the other group.")
 
     # Weekly modes
     p.add_argument("--weekly", action="store_true",
@@ -526,6 +658,10 @@ def parse_args(argv=None):
                    help="Skip the global embedding/plot entirely (e.g. when you only "
                         "want --per-week-embedding).")
     p.add_argument("--gif-fps", type=float, default=2.0, help="Frames per second for GIFs.")
+    p.add_argument("--mp4", action="store_true",
+                   help="Also write an MP4 alongside each GIF (needs ffmpeg on PATH). "
+                        "Recommended for VLC / Windows Media Player, which handle "
+                        "animated GIFs poorly.")
 
     # Embedding / TSNE params
     p.add_argument("--pca-components", type=int, default=50,
@@ -571,7 +707,8 @@ def main(argv=None):
         print(f"[ok] color-by '{args.color_by}' -> {len(spec.category_order)} categories "
               f"(palette '{args.palette}')")
     else:
-        print(f"[ok] color-by '{args.color_by}' -> gradient '{args.gradient_colorscale}' "
+        scale_name = spec.colorscale if isinstance(spec.colorscale, str) else "custom"
+        print(f"[ok] color-by '{args.color_by}' -> gradient '{scale_name}' "
               f"range {spec.crange[0]:.3g}..{spec.crange[1]:.3g}")
 
     need_mat = (not args.skip_global and not args.load_embedding) or args.per_week_embedding
