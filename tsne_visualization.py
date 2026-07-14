@@ -364,8 +364,19 @@ def sanitize(name):
     return re.sub(r"[^0-9A-Za-z._-]+", "_", str(name)).strip("_")
 
 
+def output_paths(out_path):
+    """Two paths from a desired output path: a .jpeg (same name) and a .svg with a
+    leading underscore on the filename. Whatever extension is passed is ignored."""
+    directory, base = os.path.split(out_path)
+    stem = os.path.splitext(base)[0]
+    jpeg_path = os.path.join(directory, stem + ".jpeg")
+    svg_path = os.path.join(directory, "_" + stem + ".svg")
+    return jpeg_path, svg_path
+
+
 def plot_embedding(embedding, values, spec, title, out_path, args, show=False):
-    """Scatter an (N, 2) embedding colored per `spec` and write it to `out_path`."""
+    """Scatter an (N, 2) embedding colored per `spec`, writing a .jpeg and a .svg
+    (the .svg name gets a leading underscore). Returns the .jpeg path."""
     kwargs = dict(
         x=embedding[:, 0],
         y=embedding[:, 1],
@@ -384,11 +395,20 @@ def plot_embedding(embedding, values, spec, title, out_path, args, show=False):
 
     fig = px.scatter(**kwargs)
     fig.update_traces(marker=dict(size=args.marker_size))
-    fig.update_layout(width=args.width, height=args.height)
-    fig.write_image(out_path)
+    fig.update_layout(width=args.width, height=args.height,
+                      plot_bgcolor="white")
+    # Show the left/bottom axis lines only (no mirrored bars opposite them) and
+    # drop the grey background grid.
+    axis_style = dict(showline=True, linecolor="black", linewidth=1,
+                      mirror=False, showgrid=False, zeroline=False)
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
+    jpeg_path, svg_path = output_paths(out_path)
+    fig.write_image(jpeg_path)
+    fig.write_image(svg_path)
     if show:
         fig.show()
-    return out_path
+    return jpeg_path
 
 
 def build_gif(png_paths, gif_path, fps):
@@ -450,11 +470,11 @@ def build_mp4(png_paths, mp4_path, fps):
     tmpdir = tempfile.mkdtemp(prefix="tsne_mp4_")
     try:
         for i, p in enumerate(png_paths):
-            shutil.copyfile(p, os.path.join(tmpdir, f"frame_{i:05d}.png"))
+            shutil.copyfile(p, os.path.join(tmpdir, f"frame_{i:05d}.jpeg"))
         cmd = [
             ffmpeg, "-y",
             "-framerate", str(fps),                       # each image shows 1/fps s
-            "-i", os.path.join(tmpdir, "frame_%05d.png"),
+            "-i", os.path.join(tmpdir, "frame_%05d.jpeg"),
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",    # even dims for yuv420p
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", mp4_path,
         ]
@@ -498,11 +518,11 @@ def run_weekly_subset(embedding, details, spec, out_root, args):
         if n == 0:
             continue
         title = f"openTSNE by {spec.label} - Week {week} (n={n})"
-        out_path = os.path.join(sub_dir, f"tsne_week_{sanitize(week)}.png")
-        plot_embedding(embedding[mask], spec.values[mask], spec, title, out_path,
-                       args, show=args.show)
-        print(f"[ok] week {week}: {out_path}")
-        frames.append(out_path)
+        out_path = os.path.join(sub_dir, f"tsne_week_{sanitize(week)}")
+        frame = plot_embedding(embedding[mask], spec.values[mask], spec, title,
+                               out_path, args, show=args.show)
+        print(f"[ok] week {week}: {frame}")
+        frames.append(frame)
     build_animation(frames, os.path.join(sub_dir, f"tsne_weekly_{args.color_by}.gif"),
                     args.gif_fps, args.mp4)
 
@@ -542,11 +562,11 @@ def run_per_week_embedding(mat_path, details, spec, out_root, args):
                 print(f"[ok] saved weekly embedding: {csv_path}")
 
             title = f"openTSNE by {spec.label} - Week {week} embedding (n={n})"
-            out_path = os.path.join(sub_dir, f"tsne_week_{sanitize(week)}.png")
-            plot_embedding(embedding, spec.values[mask], spec, title, out_path,
-                           args, show=args.show)
-            print(f"[ok] week {week}: {out_path}")
-            frames.append(out_path)
+            out_path = os.path.join(sub_dir, f"tsne_week_{sanitize(week)}")
+            frame = plot_embedding(embedding, spec.values[mask], spec, title,
+                                   out_path, args, show=args.show)
+            print(f"[ok] week {week}: {frame}")
+            frames.append(frame)
     build_animation(frames, os.path.join(sub_dir, f"tsne_weekly_embeddings_{args.color_by}.gif"),
                     args.gif_fps, args.mp4)
 
@@ -585,11 +605,11 @@ def run_global(mat_path, details, spec, out_root, args):
         pd.DataFrame(embedding, columns=["tsne_1", "tsne_2"]).to_csv(ep, index=False)
         print(f"[ok] saved embedding: {ep}")
 
-    out_path = os.path.join(out_root, f"tsne_by_{args.color_by}.png")
-    plot_embedding(embedding, spec.values, spec,
-                   f"openTSNE Multiscale colored by {spec.label}",
-                   out_path, args, show=args.show)
-    print(f"[ok] global plot: {out_path}")
+    out_path = os.path.join(out_root, f"tsne_by_{args.color_by}")
+    jpeg_path = plot_embedding(embedding, spec.values, spec,
+                               f"openTSNE Multiscale colored by {spec.label}",
+                               out_path, args, show=args.show)
+    print(f"[ok] global plot: {jpeg_path}")
     return embedding
 
 
