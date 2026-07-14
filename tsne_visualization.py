@@ -83,14 +83,37 @@ PLOTLY_PALETTES = [
     "Plotly", "D3", "G10", "Dark24", "Light24", "Alphabet",
     "Bold", "Safe", "Set1", "Pastel", "Antique", "Prism",
 ]
-PALETTE_CHOICES = list(GLASBEY_PALETTES) + PLOTLY_PALETTES
+# matplotlib colormaps (converted to hex for use in the plotly plots). List only
+# names NOT already provided by plotly above, to keep the choices unambiguous.
+# Discrete (ListedColormap) palettes are cycled; any continuous map is sampled.
+MATPLOTLIB_PALETTES = [
+    "tab10", "tab20", "tab20b", "tab20c", "paired", "accent", "summer",
+]
+PALETTE_CHOICES = list(GLASBEY_PALETTES) + PLOTLY_PALETTES + MATPLOTLIB_PALETTES
 
 
 def palette_colors(palette, n):
-    """Return n hex colors from the named palette (glasbey generated, plotly cycled)."""
+    """Return n hex colors from the named palette.
+
+    glasbey palettes are generated to size; plotly and matplotlib qualitative
+    palettes are cycled; a continuous matplotlib map is sampled evenly.
+    """
     if palette in GLASBEY_PALETTES:
         import glasbey  # imported lazily so plotly-only palettes don't need it
         return list(glasbey.create_palette(palette_size=n, **GLASBEY_PALETTES[palette]))
+    if palette in MATPLOTLIB_PALETTES:
+        import matplotlib
+        from matplotlib.colors import to_hex
+        # matplotlib colormap names are case-sensitive ("Paired", "Accent"); resolve
+        # case-insensitively so list entries work regardless of capitalization.
+        registry = matplotlib.colormaps
+        name = palette if palette in registry else next(
+            (k for k in registry if k.lower() == palette.lower()), palette)
+        cmap = registry[name]
+        if hasattr(cmap, "colors"):  # discrete qualitative colormap
+            base = [to_hex(c) for c in cmap.colors]
+            return [base[i % len(base)] for i in range(n)]
+        return [to_hex(cmap(i / max(1, n - 1))) for i in range(n)]  # continuous
     base = getattr(px.colors.qualitative, palette)
     return [base[i % len(base)] for i in range(n)]
 
@@ -136,22 +159,44 @@ OCC3D_COLORSCALE = [
     [0.75, "#ff2f7a"],
     [1.00, "#ff2a00"],  # pure 3D
 ]
-# Hand-picked colors for the categorical temporal masks (falls back to the chosen
-# palette for any category not listed here). NaN/missing -> "unknown" -> gray.
+# Hand-picked colors for tba_class (falls back to the chosen palette for any
+# category not listed here). NaN/missing -> "unknown" -> gray.
 PREFERRED_COLORS = {
-    "temporal_class": {
-        "early": "#4575b4", "mid": "#74add1", "late": "#f46d43",
-        "sustained": "#d73027", "uncategorized": "#bdbdbd", "unknown": "#7a7a7a",
-    },
     "tba_class": {"low": "#5c95db", "high": "#e83a3a", "unknown": "#7a7a7a"},
 }
 PREFERRED_ORDER = {
-    "temporal_class": ["early", "mid", "late", "sustained", "uncategorized", "unknown"],
     "tba_class": ["low", "high", "unknown"],
 }
 # De-emphasized categories drawn first so they sit UNDERNEATH the meaningful
 # points (plotly draws earlier categories at the bottom of the z-order).
 BACKGROUND_CATEGORIES = {"uncategorized", "unknown"}
+
+# temporal_class coloring: early->mid->sustained->late span the active palette;
+# uncategorized always shares sustained's color; unknown is always gray.
+TEMPORAL_SPAN_ORDER = ["early", "mid", "sustained", "late"]
+TEMPORAL_UNKNOWN_COLOR = "#7a7a7a"
+# Legend / z-order for temporal_class (unknown first = drawn at the bottom).
+TEMPORAL_DRAW_ORDER = ["unknown", "early", "mid", "sustained", "uncategorized", "late"]
+
+
+def temporal_class_coloring(palette, present):
+    """Return (discrete_map, category_order) for the temporal_class mask.
+
+    early/mid/sustained/late span the palette in that order; uncategorized takes
+    sustained's color; unknown is fixed gray. `present` is the set of categories
+    actually in the data.
+    """
+    span = palette_colors(palette, len(TEMPORAL_SPAN_ORDER))
+    cmap = {cat: span[i] for i, cat in enumerate(TEMPORAL_SPAN_ORDER)}
+    cmap["uncategorized"] = cmap["sustained"]      # sustained == uncategorized
+    cmap["unknown"] = TEMPORAL_UNKNOWN_COLOR       # always gray
+    order = [c for c in TEMPORAL_DRAW_ORDER if c in present]
+    for c in present:  # keep any unexpected category visible
+        if c not in cmap:
+            cmap[c] = TEMPORAL_UNKNOWN_COLOR
+        if c not in order:
+            order.append(c)
+    return cmap, order
 
 
 class ColorSpec:
@@ -170,7 +215,7 @@ class ColorSpec:
         self.label = COLOR_LABELS[color_by]
 
 
-def build_coloring(details, color_by, palette, gradient_colorscale):
+def build_coloring(details, color_by, palette, gradient_colorscale, palette_specified=False):
     if color_by in TEMPORAL_COLUMNS and color_by not in details.columns:
         sys.exit(f"[error] --color-by {color_by} needs the '{color_by}' column; "
                  f"provide Cluster_detail_results_temporal.csv (see --temporal-name).")
@@ -205,7 +250,10 @@ def build_coloring(details, color_by, palette, gradient_colorscale):
         colors = palette_colors(palette, len(names))
         discrete_map = {n: colors[i] for i, n in enumerate(names)}
         order = names
-    else:  # temporal_class / tba_class
+    elif color_by == "temporal_class":
+        values = details[color_by].astype("string").fillna("unknown").to_numpy()
+        discrete_map, order = temporal_class_coloring(palette, set(pd.unique(values)))
+    else:  # tba_class
         values = details[color_by].astype("string").fillna("unknown").to_numpy()
         present = list(pd.unique(values))
         pref_order = PREFERRED_ORDER[color_by]
@@ -214,9 +262,16 @@ def build_coloring(details, color_by, palette, gradient_colorscale):
         # Draw background categories first (bottom) so meaningful points sit on top.
         order = ([c for c in semantic if c in BACKGROUND_CATEGORIES]
                  + [c for c in semantic if c not in BACKGROUND_CATEGORIES])
-        fallback = palette_colors(palette, len(order))
-        preferred = PREFERRED_COLORS[color_by]
-        discrete_map = {name: preferred.get(name, fallback[i]) for i, name in enumerate(order)}
+        if palette_specified:
+            # An explicit --palette overrides the hand-picked PREFERRED_COLORS.
+            # Colors are assigned in semantic order so the meaningful categories
+            # get the leading palette colors (z-order still follows `order`).
+            colors = palette_colors(palette, len(semantic))
+            discrete_map = {name: colors[i] for i, name in enumerate(semantic)}
+        else:
+            fallback = palette_colors(palette, len(order))
+            preferred = PREFERRED_COLORS[color_by]
+            discrete_map = {name: preferred.get(name, fallback[i]) for i, name in enumerate(order)}
 
     return ColorSpec(color_by, values, "categorical",
                      discrete_map=discrete_map, category_order=order)
@@ -380,8 +435,8 @@ def plot_embedding(embedding, values, spec, title, out_path, args, show=False):
     kwargs = dict(
         x=embedding[:, 0],
         y=embedding[:, 1],
-        range_x=[-90, 90],
-        range_y=[-90,90],
+        range_x=[-110, 110],
+        range_y=[-110,110],
         color=values,
         title=title,
         labels={"x": "t-SNE 1", "y": "t-SNE 2", "color": spec.label},
@@ -650,9 +705,12 @@ def parse_args(argv=None):
                    help="Which color mask to use: cluster index (glasbey), "
                         "temporal_class, tba_class, a tba gradient, or occ3d "
                         "(per-cluster 3D-arena occupancy fraction, 0..1).")
-    p.add_argument("--palette", default="glasbey", choices=PALETTE_CHOICES,
-                   help="Categorical palette (used for cluster mode and as a "
-                        "fallback for unlisted temporal categories).")
+    p.add_argument("--palette", default=None, choices=PALETTE_CHOICES,
+                   help="Categorical palette for cluster mode. When given explicitly "
+                        "it also OVERRIDES the built-in temporal_class/tba_class "
+                        "colors (otherwise those use the hand-picked PREFERRED_COLORS). "
+                        "glasbey, plotly, and matplotlib (tab10/tab20/...) palettes "
+                        "are supported. Default: glasbey.")
     p.add_argument("--gradient-colorscale", default=None,
                    help="Continuous colorscale for tba/occ3d (any plotly colorscale "
                         "name, e.g. Viridis, Turbo, RdBu). Default: Viridis for tba, "
@@ -721,11 +779,16 @@ def main(argv=None):
     details = load_details(details_path, temporal_path)
     print(f"[ok] {len(details)} points across {details['Week'].nunique()} weeks")
 
-    # Shared color mask, computed once over all points.
-    spec = build_coloring(details, args.color_by, args.palette, args.gradient_colorscale)
+    # Shared color mask, computed once over all points. An explicit --palette
+    # overrides the built-in temporal/tba colors; the default is glasbey.
+    palette = args.palette or "glasbey"
+    palette_specified = args.palette is not None
+    spec = build_coloring(details, args.color_by, palette, args.gradient_colorscale,
+                          palette_specified)
     if spec.mode == "categorical":
+        origin = "" if palette_specified else ", default"
         print(f"[ok] color-by '{args.color_by}' -> {len(spec.category_order)} categories "
-              f"(palette '{args.palette}')")
+              f"(palette '{palette}'{origin})")
     else:
         scale_name = spec.colorscale if isinstance(spec.colorscale, str) else "custom"
         print(f"[ok] color-by '{args.color_by}' -> gradient '{scale_name}' "
